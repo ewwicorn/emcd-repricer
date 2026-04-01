@@ -6,11 +6,15 @@ This script monitors the market and updates your offer prices to stay competitiv
 
 ## Getting started
 
-1. Install the dependencies by running (`setup.bat`) file.
+1. Install [python](https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe).
 
-2. Run the script using (`run.bat`) file.
+2. Install the dependencies by running (`setup.bat`) file.
 
-3. Log in your account on the first run (session will remain for ~7 days)
+3. Configure the configuration file (`config.yaml`)
+
+4. Run the script using (`run.bat`) file.
+
+5. Log in your account on the first run (session will remain for ~7 days)
 ## Configuration Overview
 
 The configuration file (`config.yaml`) controls how the repricer behaves.
@@ -148,7 +152,8 @@ accounts:
   - name: "acc1"
     email: "example@mail.com"
     password: "password"
-
+    proxies:
+      - "http://username:password@host:port"
     offers:
       - offer_id: "example-id"
         crypto: "usdt"
@@ -156,7 +161,8 @@ accounts:
         direction: "buy"
         price_step: 0.01
         ignored_users:
-          - "example_user"
+          - "example_user1"
+          - "example_user2"
 ```
 
 ---
