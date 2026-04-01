@@ -1,0 +1,20 @@
+interval_min: 15
+interval_max: 25
+price_step: 0.01
+dry_run: false
+
+accounts:
+  - name: "acc1"
+    email: "example@mail.com"
+    password: "password"
+    proxies:
+      - "http://username:password@host:port"
+    offers:
+      - offer_id: "example-id"
+        crypto: "usdt"
+        fiat: "rub"
+        direction: "buy"
+        price_step: 0.01
+        ignored_users:
+          - "example_user1"
+          - "example_user2"
