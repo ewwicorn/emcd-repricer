@@ -360,7 +360,10 @@ class EmcdP2PClient:
             if self._session_valid():
                 return
 
-            self.log.info("Launching browser for login...")
+            # Clear old session before attempting fresh login
+            self.log.info("Clearing old session and launching browser for login...")
+            self._saved_cookies = []
+            self._token = None
 
             async with async_playwright() as pw:
                 launch_kwargs: Dict = {"headless": False}
@@ -449,10 +452,13 @@ class EmcdP2PClient:
                     for c in raw_cookies
                 ]
                 
+                self.log.debug("Extracted %d cookies from browser", len(self._saved_cookies))
+                
                 # Extract auth token from cookies
                 for c in raw_cookies:
                     if c["name"] == "auth__access_token":
                         self._token = c["value"]
+                        self.log.debug("Extracted auth__access_token: %s...", self._token[:50] if self._token else "None")
                         break
 
                 # Verify that critical auth token was found
@@ -461,6 +467,8 @@ class EmcdP2PClient:
                 await browser.close()
 
                 if not has_auth_token:
+                    self.log.error("No auth__access_token found after login!")
+                    self.log.error("Cookie names: %s", [c["name"] for c in self._saved_cookies])
                     raise RuntimeError(
                         "No auth__access_token found after login. "
                         "Check the token at https://emcd.io."

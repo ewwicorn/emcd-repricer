@@ -19,7 +19,7 @@ from repricer_logic import run_account
 def _setup_logging() -> None:
     """Configure root logger to write timestamped records to stdout."""
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
