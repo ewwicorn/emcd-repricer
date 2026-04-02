@@ -2,21 +2,20 @@
 EMCD P2P API Client — async HTTP client with automatic session management.
 
 Authentication flow:
-  1. On startup, load saved tokens and cookies from disk.
+  1. On startup, load saved cookies and tokens from disk.
   2. If access_token is missing or expired, attempt a silent refresh via
-     the EMCD refresh-token endpoint (no browser needed).
-  3. Only if the silent refresh fails, launch a headless Chromium browser
+     the EMCD /auth/refresh API endpoint (no browser needed).
+  3. Only if the API refresh fails, launch a real Chromium browser
      via Playwright, perform a full login, and capture the resulting
-     cookie jar.
-  4. The full cookie jar (not just the two auth cookies) is persisted to
-     disk so the next run can skip the browser entirely.
-  5. Before every outgoing request, proactively refresh the access_token
-     when fewer than TOKEN_REFRESH_THRESHOLD seconds remain.
-  6. On an unexpected 401, retry once after a silent refresh and fall
-     back to the browser only as a last resort.
+     cookie jar and tokens.
+  4. The full token set (access_token + refresh_token) and cookie jar
+     are persisted to disk so the next run can skip the browser entirely.
+  5. Before every outgoing request, handle unexpected 401 errors by
+     attempting an API refresh first, falling back to browser only
+     if necessary.
 
 Proxy support:
-  Multiple proxies can be provided per account.  The client rotates to
+  Multiple proxies can be provided per account. The client rotates to
   the next proxy after MAX_PROXY_ERRORS consecutive connection failures.
 """
 
@@ -194,7 +193,7 @@ class EmcdP2PClient:
 
         if self._parsed_proxies:
             httpx_proxy, _ = self._parsed_proxies[self._current_proxy_index]
-            kwargs["proxy"] = httpx_proxy
+            kwargs["proxies"] = httpx_proxy
             self.log.info(
                 "Using proxy [%d/%d]: %s",
                 self._current_proxy_index + 1,
@@ -233,17 +232,21 @@ class EmcdP2PClient:
                 data = json.load(fh)
 
             self._saved_cookies = data.get("cookies", [])
+            self._refresh_token = data.get("refresh_token")
 
             if self._saved_cookies:
-                # Extract token from cookies for use in headers
+                # Extract tokens from cookies and/or session file
                 for cookie in self._saved_cookies:
                     if cookie["name"] == "auth__access_token":
                         self._token = cookie["value"]
-                        break
+                    elif cookie["name"] == "auth__refresh_token" and not self._refresh_token:
+                        self._refresh_token = cookie["value"]
                 
                 self._apply_session_to_client()
                 self.log.info(
-                    "Session loaded — %d cookies restored, token extracted", len(self._saved_cookies)
+                    "Session loaded — %d cookies, has_tokens=%s", 
+                    len(self._saved_cookies),
+                    bool(self._token and self._refresh_token)
                 )
                 return True
 
@@ -262,8 +265,9 @@ class EmcdP2PClient:
         """
         try:
             data = {
-                "cookies":  self._saved_cookies,
-                "saved_at": time.time(),
+                "cookies":       self._saved_cookies,
+                "refresh_token": self._refresh_token,
+                "saved_at":      time.time(),
             }
             with self._session_file().open("w") as fh:
                 json.dump(data, fh, indent=2)
@@ -329,11 +333,160 @@ class EmcdP2PClient:
             self.log.debug("Could not decode JWT: %s", exc)
             self._token_expiry = None
 
+    def _is_refresh_token_valid(self) -> bool:
+        """
+        Check if the refresh_token is still valid (not expired).
+        
+        For JWT-formatted refresh tokens, checks the exp claim.
+        For UUID/opaque refresh tokens, always returns True (let the server validate).
+        
+        Returns:
+            ``True`` if refresh_token should be attempted; ``False`` if we're sure it's invalid.
+        """
+        if not self._refresh_token:
+            return False
+        
+        # If it's not a JWT (no dots), it's likely opaque/UUID — let the server validate
+        if "." not in self._refresh_token:
+            return True
+        
+        # It's a JWT, try to decode and check expiry
+        try:
+            payload = jwt.decode(
+                self._refresh_token, options={"verify_signature": False}
+            )
+            exp = payload.get("exp")
+            if exp:
+                is_valid = exp > time.time()
+                if not is_valid:
+                    self.log.warning(
+                        "Refresh token has expired (%.0fs ago)",
+                        time.time() - exp
+                    )
+                return is_valid
+            return True
+        except Exception as exc:
+            self.log.debug("Could not decode refresh_token: %s", exc)
+            # If decode fails, assume it's valid and let the server decide
+            return True
+
     def _session_valid(self) -> bool:
         """
         Return ``True`` when cookies are present and session is ready.
         """
         return bool(self._saved_cookies)
+
+    # ------------------------------------------------------------------
+    # API-based token refresh (no browser needed)
+    # ------------------------------------------------------------------
+
+    async def _refresh_token_via_api(self) -> bool:
+        """
+        Refresh the access token via the /auth/refresh API endpoint.
+        
+        This method calls the official refresh endpoint with the current
+        access_token and refresh_token, retrieving a new access_token
+        without any browser interaction.
+        
+        Returns:
+            ``True`` if refresh succeeded; ``False`` if it failed.
+        """
+        if not self._token or not self._refresh_token:
+            self.log.warning("Cannot refresh: missing access_token or refresh_token")
+            return False
+        
+        # Check if refresh_token has expired (fast local check, no network)
+        if not self._is_refresh_token_valid():
+            self.log.warning("Refresh token is expired — need full re-login")
+            return False
+        
+        try:
+            self.log.info("Calling /auth/refresh API endpoint...")
+            
+            # Build cookies dict from saved cookies
+            cookies_dict = {}
+            for cookie in self._saved_cookies:
+                cookies_dict[cookie["name"]] = cookie["value"]
+            
+            # Ensure fresh refresh_token is in cookies
+            cookies_dict["auth__refresh_token"] = self._refresh_token
+            
+            # Create a fresh HTTP client with all cookies
+            refresh_client = httpx.AsyncClient(
+                base_url="https://endpoint.emcd.io",
+                headers=dict(_DEFAULT_HEADERS),
+                cookies=cookies_dict,
+                timeout=15.0
+            )
+            
+            try:
+                # Prepare headers for refresh request
+                refresh_headers = {
+                    "x-access-token": self._token,
+                    "Content-Type": "application/json",
+                    "Referer": "https://emcd.io/p2p/",
+                }
+                
+                # Log what we're sending for debugging
+                self.log.debug(
+                    "Sending refresh request: access_token=%s..., refresh_token=%s",
+                    self._token[:50] if self._token else "None",
+                    self._refresh_token
+                )
+                
+                resp = await refresh_client.post(
+                    "/auth/refresh",
+                    json={
+                        "access_token": self._token,
+                        "refresh_token": self._refresh_token
+                    },
+                    headers=refresh_headers
+                )
+                
+                # Check for successful response
+                if resp.status_code != 200:
+                    self.log.warning("Token refresh failed with status %d", resp.status_code)
+                    try:
+                        error_body = resp.json()
+                        self.log.debug("Error response: %s", error_body)
+                    except:
+                        self.log.debug("Response text: %s", resp.text)
+                    return False
+                
+                # Parse response - look for new token in response body
+                data = resp.json()
+                new_access_token = data.get("access_token")
+                new_refresh_token = data.get("refresh_token")
+                
+                if new_access_token and new_access_token != self._token:
+                    self.log.info("✓ Token refresh successful via API!")
+                    self._token = new_access_token
+                    
+                    # Update tokens in saved_cookies to match response
+                    for cookie in self._saved_cookies:
+                        if cookie["name"] == "auth__access_token":
+                            cookie["value"] = new_access_token
+                        elif cookie["name"] == "auth__refresh_token" and new_refresh_token:
+                            cookie["value"] = new_refresh_token
+                    
+                    # Update refresh_token if server provided a new one
+                    if new_refresh_token:
+                        self.log.debug("Updated refresh_token from response")
+                        self._refresh_token = new_refresh_token
+                    
+                    self._apply_session_to_client()
+                    self._save_session()
+                    return True
+                else:
+                    self.log.warning("API refresh returned same or no token")
+                    return False
+                    
+            finally:
+                await refresh_client.aclose()
+                
+        except Exception as e:
+            self.log.debug("Token refresh API call failed: %s", e)
+            return False
 
     # ------------------------------------------------------------------
     # Browser-based login
@@ -454,17 +607,22 @@ class EmcdP2PClient:
                 
                 self.log.debug("Extracted %d cookies from browser", len(self._saved_cookies))
                 
-                # Extract auth token from cookies
+                # Extract auth tokens from cookies
+                self._refresh_token = None
                 for c in raw_cookies:
                     if c["name"] == "auth__access_token":
                         self._token = c["value"]
                         self.log.debug("Extracted auth__access_token: %s...", self._token[:50] if self._token else "None")
-                        break
+                    elif c["name"] == "auth__refresh_token":
+                        self._refresh_token = c["value"]
+                        self.log.debug("Extracted auth__refresh_token")
 
-                # Verify that critical auth token was found
-                has_auth_token = self._token is not None
+                # Verify that critical auth tokens were found
+                has_auth_token = self._token is not None and self._refresh_token is not None
 
+                self.log.info("Closing browser...")
                 await browser.close()
+                self.log.info("Browser closed successfully.")
 
                 if not has_auth_token:
                     self.log.error("No auth__access_token found after login!")
@@ -474,11 +632,12 @@ class EmcdP2PClient:
                         "Check the token at https://emcd.io."
                     )
 
+                self.log.info("Applying credentials and saving session...")
                 self._apply_session_to_client()
                 self._save_session()
 
                 self.log.info(
-                    "Authenticated successfully. Saved %d cookies.",
+                    "✓ Login successful! Saved %d cookies with fresh token (TTL ~7 days).",
                     len(self._saved_cookies),
                 )
 
@@ -565,8 +724,27 @@ class EmcdP2PClient:
                 # Step 4 — handle 401 Unauthorized.
                 if resp.status_code == 401 and not auth_retried:
                     auth_retried = True
-                    self.log.warning("Received 401 — re-logging in via browser.")
-                    await self.login()
+                    self.log.warning("Received 401 — attempting token refresh.")
+                    
+                    # Try API-based token refresh first (no browser needed, fast)
+                    refresh_success = await self._refresh_token_via_api()
+                    
+                    if not refresh_success:
+                        # API refresh failed, fall back to full browser login
+                        self.log.warning("API refresh failed. Launching full browser login...")
+                        self._saved_cookies = []
+                        self._token = None
+                        self._refresh_token = None
+                        
+                        try:
+                            await self.login()
+                            self.log.info("Full login successful, retrying request...")
+                        except Exception as e:
+                            self.log.error("Full login failed: %s", e)
+                            raise
+                    else:
+                        self.log.info("Token refresh successful, retrying request...")
+                    
                     await self._rebuild_http_client()
 
                     resp = await self._client.request(method, path, **kwargs)
@@ -800,6 +978,8 @@ class EmcdP2PClient:
             self.log.error("Cannot update %s: offer not found.", offer_id)
             return False
 
+        self.log.debug("Current offer data: %s", current)
+
         payload = {
             "offer_id":        offer_id,
             "amount":          current.get("amount"),
@@ -813,12 +993,15 @@ class EmcdP2PClient:
             "min_amount":      current.get("min_amount"),
             "max_fiat_amount": current.get("max_fiat_amount"),
             "min_fiat_amount": current.get("min_fiat_amount"),
-            "payment_options": current.get("payment_options", []),
+            "providers":       current.get("providers", []),
+            "payment_method_ids": current.get("payment_method_ids", []),
             "publish":         current.get("publish", False),
             "rate_rule":       {"fixed_rate": new_price},
             "rate_rule_type":  "FIXED_RATE",
             "use_fiat_limits": current.get("use_fiat_limits", True),
         }
+
+        self.log.debug("Update offer payload: %s", payload)
 
         try:
             resp = await self._request(
@@ -827,8 +1010,16 @@ class EmcdP2PClient:
             if resp.status_code in (200, 201):
                 self.log.debug("Offer %s updated to %.8g.", offer_id, new_price)
                 return True
+            
+            error_msg = f"HTTP {resp.status_code}"
+            try:
+                error_detail = resp.json()
+                error_msg += f": {error_detail}"
+            except:
+                error_msg += f": {resp.text[:200]}"
+            
             self.log.error(
-                "Failed to update offer %s: HTTP %d", offer_id, resp.status_code
+                "Failed to update offer %s: %s", offer_id, error_msg
             )
             return False
         except Exception as exc:
