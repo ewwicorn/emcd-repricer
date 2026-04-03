@@ -11,12 +11,15 @@ low-level API client (client.py).  It is responsible for:
 
 import asyncio
 import logging
+import math
 import random
 
 import httpx
 
 from client import EmcdP2PClient
 from config import AccountConfig, AppConfig, OfferConfig
+
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 
 async def reprice_offer(
@@ -43,6 +46,15 @@ async def reprice_offer(
         step:    Price increment above the market top to set.
         dry_run: When ``True``, log the intended change but skip the API call.
     """
+    def round_to_clean(price, step, direction):
+        """Round the price down to the nearest multiple of step, ensuring "clean" numbers."""
+        price_d = Decimal(str(price))
+        step_d = Decimal(str(step))
+        
+        result = (price_d / step_d).quantize(Decimal('1'), rounding=ROUND_DOWN if direction=="sell" else ROUND_UP) * step_d
+        return float(result)
+    
+    
     log = client.log
 
     top_price = await client.get_top_price(
@@ -63,11 +75,37 @@ async def reprice_offer(
         my_price = float(my_offer.get("price") or my_offer.get("rate") or 0)
         label    = f"{offer.crypto.upper()}/{offer.fiat.upper()}"
 
+        if math.isclose(my_price - top_price, step, rel_tol=1e-9, abs_tol=1e-9)  or (my_price - top_price < step and my_price - top_price > 0):
+            log.info("%s already at target: mine=%.8g market_top=%.8g", label, my_price, top_price)
+            return
+        
         if my_price > top_price:
             log.info("%s already at top: mine=%.8g market_top=%.8g", label, my_price, top_price)
+
+            new_price = round(top_price + step, 8)
+            
+            if offer.round_to_zeros:
+                 new_price = round_to_clean(new_price, step, "sell")
+            
+            log.info(
+                "%s repricing: %.8g → %.8g (market_top=%.8g)",
+                label, my_price, new_price, top_price,
+            )
+
+            if dry_run:
+                log.info("  [dry_run] update skipped.")
+                return
+
+            ok = await client.update_offer_price(offer.offer_id, new_price)
+            if ok:
+                log.info("  OK → %.8g", new_price)
+            else:
+                log.error("  FAILED to update offer %s", offer.offer_id)
             return
 
         new_price = round(top_price + step, 8)
+        if offer.round_to_zeros:
+            new_price = round_to_clean(new_price, step, "sell")
         log.info(
             "%s repricing: %.8g → %.8g (market_top=%.8g)",
             label, my_price, new_price, top_price,
@@ -94,11 +132,37 @@ async def reprice_offer(
         my_price = float(my_offer.get("price") or my_offer.get("rate") or 0)
         label    = f"{offer.crypto.upper()}/{offer.fiat.upper()}"
 
+        if math.isclose(top_price - my_price, step, rel_tol=1e-9, abs_tol=1e-9) or (top_price - my_price < step and top_price - my_price > 0):
+            log.info("%s already at target: mine=%.8g market_top=%.8g", label, my_price, top_price)
+            return
+
+
         if my_price < top_price:
             log.info("%s already at top: mine=%.8g market_top=%.8g", label, my_price, top_price)
+            new_price = round(top_price - step, 8)
+            
+            if offer.round_to_zeros:
+                new_price = round_to_clean(new_price, step, "buy")
+            
+            log.info(
+                "%s repricing: %.8g → %.8g (market_top=%.8g)",
+                label, my_price, new_price, top_price,
+            )
+
+            if dry_run:
+                log.info("  [dry_run] update skipped.")
+                return
+
+            ok = await client.update_offer_price(offer.offer_id, new_price)
+            if ok:
+                log.info("  OK → %.8g", new_price)
+            else:
+                log.error("  FAILED to update offer %s", offer.offer_id)
             return
 
         new_price = round(top_price - step, 8)
+        if offer.round_to_zeros:
+            new_price = round_to_clean(new_price, step, "buy")
         log.info(
             "%s repricing: %.8g → %.8g (market_top=%.8g)",
             label, my_price, new_price, top_price,
@@ -115,17 +179,53 @@ async def reprice_offer(
             log.error("  FAILED to update offer %s", offer.offer_id)
 
 
+async def run_offer_cycle(
+    client:  EmcdP2PClient,
+    offer:   OfferConfig,
+    cfg:     AppConfig,
+) -> None:
+    """
+    Run continuous reprice loop for a single offer, independently.
+
+    Each offer gets its own async task that runs indefinitely, repricing
+    according to its own intervals (or global defaults if not specified).
+
+    Args:
+        client: Authenticated EMCD API client for the account.
+        offer:  Offer configuration.
+        cfg:    Global application settings.
+    """
+    log = client.log
+    label = f"{offer.crypto.upper()}/{offer.fiat.upper()}"
+
+    try:
+        while True:
+            try:
+                await reprice_offer(client, offer, offer.price_step, cfg.dry_run)
+            except httpx.HTTPStatusError as exc:
+                log.error("[%s] HTTP error: %s", label, exc)
+            except Exception as exc:
+                log.error("[%s] Unexpected error: %s", label, exc, exc_info=True)
+
+            # Use per-offer intervals if configured, otherwise fall back to global
+            interval_min = offer.interval_min if offer.interval_min is not None else cfg.interval_min
+            interval_max = offer.interval_max if offer.interval_max is not None else cfg.interval_max
+            pause = random.uniform(interval_min, interval_max)
+            log.info("[%s] Sleeping %.1fs before next reprice.", label, pause)
+            await asyncio.sleep(pause)
+    except asyncio.CancelledError:
+        log.info("[%s] Task cancelled.", label)
+        raise
+
+
 async def run_account(account: AccountConfig, cfg: AppConfig) -> None:
     """
     Entry point for a single account's reprice loop.
 
     Creates an API client, ensures a valid session (loading from disk or
-    launching the browser if needed), then loops indefinitely — repricing
-    every configured offer and sleeping for a random interval between cycles.
-
-    The random sleep interval (between ``cfg.interval_min`` and
-    ``cfg.interval_max`` seconds) helps avoid rate-limiting by spreading
-    requests over time.
+    launching the browser if needed), then launches independent async tasks
+    for each configured offer. Each offer reprices according to its own
+    interval settings, allowing true parallelism.
 
     Args:
         account: Account credentials and offer list.
@@ -147,21 +247,9 @@ async def run_account(account: AccountConfig, cfg: AppConfig) -> None:
     log.info("Running. Offers configured: %d", len(account.offers))
 
     try:
-        while True:
-            for offer in account.offers:
-                try:
-                    await reprice_offer(client, offer, offer.price_step, cfg.dry_run)
-                except httpx.HTTPStatusError as exc:
-                    log.error("HTTP error for offer %s: %s", offer.offer_id, exc)
-                except Exception as exc:
-                    log.error(
-                        "Unexpected error for offer %s: %s",
-                        offer.offer_id, exc, exc_info=True,
-                    )
-
-            pause = random.uniform(cfg.interval_min, cfg.interval_max)
-            log.debug("Sleeping %.1fs before next cycle.", pause)
-            await asyncio.sleep(pause)
+        # Create independent concurrent tasks for each offer
+        tasks = [run_offer_cycle(client, offer, cfg) for offer in account.offers]
+        await asyncio.gather(*tasks)
 
     finally:
         await client.close()

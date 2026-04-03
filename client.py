@@ -114,7 +114,7 @@ def _parse_proxy_url(proxy_url: str) -> Tuple[str, Optional[Dict]]:
 
 
 # ---------------------------------------------------------------------------
-# Main client
+# Main clientlogging
 # ---------------------------------------------------------------------------
 
 class EmcdP2PClient:

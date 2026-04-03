@@ -15,6 +15,9 @@ accounts:
         fiat: "rub"
         direction: "buy"
         price_step: 0.01
+        interval_min: 10
+        interval_max: 20
+        round_to_zeros: false
         ignored_users:
           - "example_user1"
           - "example_user2"

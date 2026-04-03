@@ -46,6 +46,24 @@ class OfferConfig:
     Overrides the global ``price_step`` when specified at offer level.
     """
 
+    interval_min:  int = None
+    """
+    Minimum sleep time (seconds) between reprice cycles for this offer.
+    When not specified, falls back to the global ``interval_min`` value.
+    """
+
+    interval_max:  int = None
+    """
+    Maximum sleep time (seconds) between reprice cycles for this offer.
+    When not specified, falls back to the global ``interval_max`` value.
+    """
+    
+    round_to_zeros: bool = False
+    """
+    When ``True``, round the new price to the nearest "clean" number with
+    trailing zeros.
+    """
+
 
 @dataclass
 class AccountConfig:
@@ -128,6 +146,9 @@ def load_config(path: str) -> AppConfig:
                 direction=o["direction"].lower(),
                 ignored_users=[u.lower() for u in (o.get("ignored_users") or [])],
                 price_step=o.get("price_step", global_step),
+                interval_min=o.get("interval_min"),
+                interval_max=o.get("interval_max"),
+                round_to_zeros=o.get("round_to_zeros", False),
             )
             for o in acc_raw.get("offers", [])
         ]
